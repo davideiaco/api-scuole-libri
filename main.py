@@ -111,8 +111,8 @@ REGION_ALIASES = {
     "BASILICATA": "BASILICATA",
     "CALABRIA": "CALABRIA",
     "CAMPANIA": "CAMPANIA",
-    "EMILIA ROMAGNA": "EMILIA ROMAGNA",
-    "EMILIA-ROMAGNA": "EMILIA ROMAGNA",
+    "EMILIA ROMAGNA": "EMILIA-ROMAGNA",
+    "EMILIA-ROMAGNA": "EMILIA-ROMAGNA",
     "FRIULI VENEZIA GIULIA": "FRIULI-VENEZIA GIULIA",
     "FRIULI-VENEZIA GIULIA": "FRIULI-VENEZIA GIULIA",
     "LAZIO": "LAZIO",
@@ -193,6 +193,16 @@ def normalize_regione_input(value: str) -> str:
     raise HTTPException(status_code=400, detail=f"Regione non riconosciuta: {value}")
 
 
+def regione_for_scuole_endpoint(regione: str) -> str:
+    """
+    Converte la regione nel formato atteso dal dataset SCUANAGRAFESTAT.
+    Caso speciale: Emilia-Romagna deve essere filtrata come 'EMILIA ROMAGNA'.
+    """
+    if regione == "EMILIA-ROMAGNA":
+        return "EMILIA ROMAGNA"
+    return regione
+
+
 def require_not_blank(value: str, field_name: str) -> str:
     cleaned = normalize_spaces(value)
     if not cleaned:
@@ -253,7 +263,7 @@ def execute_sparql(endpoint: str, query: str) -> List[Dict[str, Any]]:
 # QUERY BUILDERS
 # =========================================================
 def build_province_query(regione: str) -> str:
-    regione_safe = sparql_escape_string(regione.lower())
+    regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
     return f"""
 PREFIX miur: <http://www.miur.it/ns/miur#>
 
@@ -271,7 +281,7 @@ ORDER BY ?Provincia
 
 
 def build_comuni_query(regione: str, provincia: str) -> str:
-    regione_safe = sparql_escape_string(regione.lower())
+    regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
     provincia_safe = sparql_escape_string(provincia.lower())
     return f"""
 PREFIX miur: <http://www.miur.it/ns/miur#>
@@ -292,7 +302,7 @@ ORDER BY ?DescrizioneComune
 
 
 def build_scuole_count_query(regione: str, provincia: str, comune: str) -> str:
-    regione_safe = sparql_escape_string(regione.lower())
+    regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
     provincia_safe = sparql_escape_string(provincia.lower())
     comune_safe = sparql_escape_string(comune.lower())
     return f"""
@@ -314,7 +324,7 @@ WHERE {{
 
 
 def build_scuole_query(regione: str, provincia: str, comune: str, limit: int, offset: int) -> str:
-    regione_safe = sparql_escape_string(regione.lower())
+    regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
     provincia_safe = sparql_escape_string(provincia.lower())
     comune_safe = sparql_escape_string(comune.lower())
 
@@ -357,7 +367,7 @@ OFFSET {offset}
 
 
 def build_scuole_search_count_query(regione: str, q: str) -> str:
-    regione_safe = sparql_escape_string(regione.lower())
+    regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
     q_safe = sparql_escape_string(q.lower())
     return f"""
 PREFIX miur: <http://www.miur.it/ns/miur#>
@@ -384,7 +394,7 @@ WHERE {{
 
 
 def build_scuole_search_query(regione: str, q: str, limit: int, offset: int) -> str:
-    regione_safe = sparql_escape_string(regione.lower())
+    regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
     q_safe = sparql_escape_string(q.lower())
     return f"""
 PREFIX miur: <http://www.miur.it/ns/miur#>

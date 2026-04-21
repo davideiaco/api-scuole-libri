@@ -26,6 +26,7 @@ app.add_middleware(
 # CONFIG
 # =========================================================
 MIUR_SCUOLE_ENDPOINT = "https://dati.istruzione.it/opendata/SCUANAGRAFESTAT/query"
+MIUR_SCUOLE_AUTONOME_ENDPOINT = "https://dati.istruzione.it/opendata/SCUANAAUTSTAT/query"
 MIUR_OPENDATA_BASE = "https://dati.istruzione.it/opendata"
 
 HTTP_TIMEOUT = 60
@@ -193,15 +194,33 @@ def normalize_regione_input(value: str) -> str:
     raise HTTPException(status_code=400, detail=f"Regione non riconosciuta: {value}")
 
 
+def scuole_endpoint_for_regione(regione: str) -> str:
+    """
+    Per Valle d'Aosta e Trentino-Alto Adige usa il dataset SCUANAAUTSTAT.
+    Per tutte le altre regioni usa SCUANAGRAFESTAT.
+    """
+    if regione in {"TRENTINO-ALTO ADIGE", "VALLE D'AOSTA"}:
+        return MIUR_SCUOLE_AUTONOME_ENDPOINT
+    return MIUR_SCUOLE_ENDPOINT
+
+
 def regione_for_scuole_endpoint(regione: str) -> str:
     """
-    Converte la regione nel formato atteso dal dataset SCUANAGRAFESTAT.
-    Caso speciale: Emilia-Romagna deve essere filtrata come 'EMILIA ROMAGNA'.
+    Converte la regione nel formato atteso dal dataset scuole MIUR.
+
+    Casi speciali:
+    - Emilia-Romagna -> EMILIA ROMAGNA
+    - Trentino-Alto Adige (dataset SCUANAAUTSTAT) -> TRENTINO-ALTO ADIGE
+    - Valle d'Aosta (dataset SCUANAAUTSTAT) -> VALLE D' AOSTA
     """
     if regione == "EMILIA-ROMAGNA":
         return "EMILIA ROMAGNA"
     if regione == "FRIULI-VENEZIA GIULIA":
         return "FRIULI-VENEZIA G."
+    if regione == "TRENTINO-ALTO ADIGE":
+        return "TRENTINO-ALTO ADIGE"
+    if regione == "VALLE D'AOSTA":
+        return "VALLE D' AOSTA"
     return regione
 
 
@@ -571,31 +590,34 @@ def parse_libri(bindings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # FETCHERS
 # =========================================================
 def fetch_province(regione: str) -> List[Dict[str, Any]]:
-    cache_key = build_cache_key("province", regione)
+    endpoint = scuole_endpoint_for_regione(regione)
+    cache_key = build_cache_key("province", endpoint, regione)
     cached = cache_province.get(cache_key)
     if cached is not None:
         return cached
 
-    bindings = execute_sparql(MIUR_SCUOLE_ENDPOINT, build_province_query(regione))
+    bindings = execute_sparql(endpoint, build_province_query(regione))
     result = parse_province(bindings)
     cache_province.set(cache_key, result)
     return result
 
 
 def fetch_comuni(regione: str, provincia: str) -> List[Dict[str, Any]]:
-    cache_key = build_cache_key("comuni", regione, provincia)
+    endpoint = scuole_endpoint_for_regione(regione)
+    cache_key = build_cache_key("comuni", endpoint, regione, provincia)
     cached = cache_comuni.get(cache_key)
     if cached is not None:
         return cached
 
-    bindings = execute_sparql(MIUR_SCUOLE_ENDPOINT, build_comuni_query(regione, provincia))
+    bindings = execute_sparql(endpoint, build_comuni_query(regione, provincia))
     result = parse_comuni(bindings)
     cache_comuni.set(cache_key, result)
     return result
 
 
 def fetch_scuole(regione: str, provincia: str, comune: str, page: int, page_size: int) -> Dict[str, Any]:
-    cache_key = build_cache_key("scuole", regione, provincia, comune, page, page_size)
+    endpoint = scuole_endpoint_for_regione(regione)
+    cache_key = build_cache_key("scuole", endpoint, regione, provincia, comune, page, page_size)
     cached = cache_scuole.get(cache_key)
     if cached is not None:
         return cached
@@ -603,13 +625,13 @@ def fetch_scuole(regione: str, provincia: str, comune: str, page: int, page_size
     offset = (page - 1) * page_size
 
     total_bindings = execute_sparql(
-        MIUR_SCUOLE_ENDPOINT,
+        endpoint,
         build_scuole_count_query(regione, provincia, comune),
     )
     totale = parse_single_count(total_bindings)
 
     row_bindings = execute_sparql(
-        MIUR_SCUOLE_ENDPOINT,
+        endpoint,
         build_scuole_query(regione, provincia, comune, page_size, offset),
     )
     scuole = parse_scuole(row_bindings)
@@ -626,7 +648,8 @@ def fetch_scuole(regione: str, provincia: str, comune: str, page: int, page_size
 
 
 def fetch_search_scuole(regione: str, q: str, page: int, page_size: int) -> Dict[str, Any]:
-    cache_key = build_cache_key("search", regione, q.lower(), page, page_size)
+    endpoint = scuole_endpoint_for_regione(regione)
+    cache_key = build_cache_key("search", endpoint, regione, q.lower(), page, page_size)
     cached = cache_search.get(cache_key)
     if cached is not None:
         return cached
@@ -634,13 +657,13 @@ def fetch_search_scuole(regione: str, q: str, page: int, page_size: int) -> Dict
     offset = (page - 1) * page_size
 
     total_bindings = execute_sparql(
-        MIUR_SCUOLE_ENDPOINT,
+        endpoint,
         build_scuole_search_count_query(regione, q),
     )
     totale = parse_single_count(total_bindings)
 
     row_bindings = execute_sparql(
-        MIUR_SCUOLE_ENDPOINT,
+        endpoint,
         build_scuole_search_query(regione, q, page_size, offset),
     )
     scuole = parse_search_scuole(row_bindings)
@@ -721,6 +744,7 @@ def get_province(regione: str = Query(...)) -> Dict[str, Any]:
     province = fetch_province(regione_norm)
     return {
         "regione": regione_norm,
+        "endpoint": scuole_endpoint_for_regione(regione_norm),
         "totale": len(province),
         "province": province,
     }
@@ -737,6 +761,7 @@ def get_comuni_api(
 
     return {
         "regione": regione_norm,
+        "endpoint": scuole_endpoint_for_regione(regione_norm),
         "provincia": provincia_input,
         "totale": len(comuni),
         "comuni": comuni,
@@ -758,6 +783,7 @@ def get_scuole_api(
     result = fetch_scuole(regione_norm, provincia_input, comune_input, page, page_size)
     return {
         "regione": regione_norm,
+        "endpoint": scuole_endpoint_for_regione(regione_norm),
         "provincia": provincia_input,
         "comune": comune_input,
         **result,
@@ -780,6 +806,7 @@ def search_scuole_api(
     result = fetch_search_scuole(regione_norm, q_input, page, page_size)
     return {
         "regione": regione_norm,
+        "endpoint": scuole_endpoint_for_regione(regione_norm),
         "q": q_input,
         **result,
     }

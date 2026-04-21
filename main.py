@@ -200,6 +200,8 @@ def regione_for_scuole_endpoint(regione: str) -> str:
     """
     if regione == "EMILIA-ROMAGNA":
         return "EMILIA ROMAGNA"
+    if regione == "FRIULI-VENEZIA GIULIA":
+        return "FRIULI-VENEZIA G."
     return regione
 
 

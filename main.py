@@ -1,15 +1,77 @@
 from __future__ import annotations
 
+import json
+import html
+import logging
+import os
 import re
+import sys
 import time
+from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="API Scuole + Libri")
+
+# =========================================================
+# PATH / ENV
+# =========================================================
+def get_app_dir() -> Path:
+    """
+    Restituisce la cartella applicazione:
+    - se script Python: cartella del file .py
+    - se eseguibile PyInstaller: cartella del file .exe
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = get_app_dir()
+ENV_PATH = APP_DIR / "config.env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+
+# =========================================================
+# APP
+# =========================================================
+app = FastAPI(title="API Scuole + Libri + Shopify")
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+logger = logging.getLogger("api_scuole_libri")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if not logger.handlers:
+    _console = logging.StreamHandler()
+    _console.setLevel(logging.INFO)
+    _console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(_console)
+
+
+def log_error(msg: str, details: Any = None, *, max_chars: int = 2500) -> None:
+    if details is None:
+        logger.error(msg)
+        return
+
+    try:
+        s = json.dumps(details, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        s = str(details)
+
+    if len(s) > max_chars:
+        s = s[:max_chars] + f"\n…(troncato, {len(s)} chars totali)"
+
+    logger.error(f"{msg}\n{s}")
+
 
 # =========================================================
 # CORS
@@ -22,6 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -31,7 +94,19 @@ MIUR_OPENDATA_BASE = "https://dati.istruzione.it/opendata"
 
 HTTP_TIMEOUT = 60
 SPARQL_PAGE_SIZE = 1000
-USER_AGENT = "fastapi-scuole-libri/3.0"
+USER_AGENT = "fastapi-scuole-libri/4.0"
+
+SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
+SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01").strip()
+SHOPIFY_LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID", "").strip()
+
+SHOPIFY_REFRESH_CLIENT_ID = os.getenv("SHOPIFY_REFRESH_CLIENT_ID", "").strip()
+SHOPIFY_REFRESH_CLIENT_SECRET = os.getenv("SHOPIFY_REFRESH_CLIENT_SECRET", "").strip()
+
+EXTERNAL_ID_NAMESPACE = "custom"
+EXTERNAL_ID_KEY = "external_id"
+
 
 # =========================================================
 # CACHE TTL SEMPLICE
@@ -80,6 +155,8 @@ cache_comuni = TTLCache(ttl_seconds=24 * 3600, max_items=1024)
 cache_scuole = TTLCache(ttl_seconds=24 * 3600, max_items=8192)
 cache_search = TTLCache(ttl_seconds=6 * 3600, max_items=4096)
 cache_libri = TTLCache(ttl_seconds=24 * 3600, max_items=8192)
+cache_shopify_lookup = TTLCache(ttl_seconds=6 * 3600, max_items=4096)
+
 
 # =========================================================
 # COSTANTI DOMINIO
@@ -161,8 +238,9 @@ ALT_DATASET_BY_REGION = {
     "VENETO": "ALTVENETO",
 }
 
+
 # =========================================================
-# UTILS
+# HTTP SESSION
 # =========================================================
 http_session = requests.Session()
 http_session.headers.update(
@@ -173,6 +251,9 @@ http_session.headers.update(
 )
 
 
+# =========================================================
+# UTILS
+# =========================================================
 def norm(value: Optional[str]) -> str:
     return (value or "").strip().upper()
 
@@ -195,24 +276,12 @@ def normalize_regione_input(value: str) -> str:
 
 
 def scuole_endpoint_for_regione(regione: str) -> str:
-    """
-    Per Valle d'Aosta e Trentino-Alto Adige usa il dataset SCUANAAUTSTAT.
-    Per tutte le altre regioni usa SCUANAGRAFESTAT.
-    """
     if regione in {"TRENTINO-ALTO ADIGE", "VALLE D'AOSTA"}:
         return MIUR_SCUOLE_AUTONOME_ENDPOINT
     return MIUR_SCUOLE_ENDPOINT
 
 
 def regione_for_scuole_endpoint(regione: str) -> str:
-    """
-    Converte la regione nel formato atteso dal dataset scuole MIUR.
-
-    Casi speciali:
-    - Emilia-Romagna -> EMILIA ROMAGNA
-    - Trentino-Alto Adige (dataset SCUANAAUTSTAT) -> TRENTINO-ALTO ADIGE
-    - Valle d'Aosta (dataset SCUANAAUTSTAT) -> VALLE D' AOSTA
-    """
     if regione == "EMILIA-ROMAGNA":
         return "EMILIA ROMAGNA"
     if regione == "FRIULI-VENEZIA GIULIA":
@@ -281,7 +350,254 @@ def execute_sparql(endpoint: str, query: str) -> List[Dict[str, Any]]:
 
 
 # =========================================================
-# QUERY BUILDERS
+# SHOPIFY TOKEN REFRESH
+# =========================================================
+def _shop_name_only(shop_value: str) -> str:
+    shop_value = (shop_value or "").strip()
+    if not shop_value:
+        return ""
+    return (
+        shop_value
+        .replace("https://", "")
+        .replace("http://", "")
+        .replace(".myshopify.com", "")
+        .strip("/")
+    )
+
+
+def update_config_env_access_token(new_token: str, file_path: Path = ENV_PATH) -> None:
+    if not new_token:
+        raise ValueError("Nuovo access token vuoto")
+
+    if file_path.exists():
+        content = file_path.read_text(encoding="utf-8")
+    else:
+        content = ""
+
+    pattern = r"(?m)^SHOPIFY_ACCESS_TOKEN=.*$"
+    replacement = f"SHOPIFY_ACCESS_TOKEN={new_token}"
+
+    if re.search(pattern, content):
+        new_content = re.sub(pattern, replacement, content)
+    else:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        new_content = content + replacement + "\n"
+
+    file_path.write_text(new_content, encoding="utf-8")
+
+
+def refresh_shopify_access_token() -> str:
+    global SHOPIFY_ACCESS_TOKEN
+
+    shop_name = _shop_name_only(SHOPIFY_SHOP)
+    if not shop_name:
+        raise RuntimeError("SHOPIFY_SHOP mancante o non valido")
+
+    refresh_url = f"https://{shop_name}.myshopify.com/admin/oauth/access_token"
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": SHOPIFY_REFRESH_CLIENT_ID,
+        "client_secret": SHOPIFY_REFRESH_CLIENT_SECRET,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    logger.info("Token Shopify non valido/scaduto: rigenerazione access token in corso")
+
+    resp = requests.post(refresh_url, headers=headers, data=payload, timeout=60)
+    resp.raise_for_status()
+
+    data = resp.json()
+    new_token = (data.get("access_token") or "").strip()
+    if not new_token:
+        log_error("Rigenerazione token fallita: risposta senza access_token", data)
+        raise RuntimeError("Risposta refresh token senza access_token")
+
+    update_config_env_access_token(new_token)
+    SHOPIFY_ACCESS_TOKEN = new_token
+    os.environ["SHOPIFY_ACCESS_TOKEN"] = new_token
+
+    logger.info("Nuovo access token Shopify generato e salvato in: %s", str(ENV_PATH.resolve()))
+    return new_token
+
+
+def _graphql_has_auth_error(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+
+    errors = data.get("errors") or []
+    for err in errors:
+        msg = str((err or {}).get("message") or "").lower()
+        ext_code = str(((err or {}).get("extensions") or {}).get("code") or "").lower()
+
+        if (
+            "invalid api key or access token" in msg
+            or "access denied" in msg
+            or "unauthorized" in msg
+            or "forbidden" in msg
+            or ext_code in {"unauthorized", "forbidden", "access_denied"}
+        ):
+            return True
+
+    return False
+
+
+def _is_auth_http_error(resp: Optional[requests.Response]) -> bool:
+    if resp is None:
+        return False
+    return resp.status_code in (401, 403)
+
+
+# =========================================================
+# SHOPIFY GRAPHQL
+# =========================================================
+def shopify_endpoint() -> str:
+    if not SHOPIFY_SHOP or not SHOPIFY_ACCESS_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="Configurazione Shopify mancante: SHOPIFY_SHOP / SHOPIFY_ACCESS_TOKEN",
+        )
+    return f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+
+
+def shopify_graphql(
+    query: str,
+    variables: Dict[str, Any],
+    *,
+    max_retries: int = 6,
+) -> Dict[str, Any]:
+    global SHOPIFY_ACCESS_TOKEN
+
+    endpoint = shopify_endpoint()
+    current_token = SHOPIFY_ACCESS_TOKEN
+    auth_refresh_done = False
+
+    for attempt in range(max_retries):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": current_token,
+        }
+
+        try:
+            resp = requests.post(
+                endpoint,
+                headers=headers,
+                json={"query": query, "variables": variables},
+                timeout=180,
+            )
+
+            if _is_auth_http_error(resp):
+                if auth_refresh_done:
+                    resp.raise_for_status()
+
+                current_token = refresh_shopify_access_token()
+                SHOPIFY_ACCESS_TOKEN = current_token
+                auth_refresh_done = True
+                logger.info("Retry chiamata Shopify GraphQL con nuovo access token")
+                continue
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            if _graphql_has_auth_error(data):
+                if auth_refresh_done:
+                    log_error("Errore autenticazione Shopify anche dopo refresh token", data)
+                    raise RuntimeError("Autenticazione Shopify fallita anche dopo refresh token")
+
+                current_token = refresh_shopify_access_token()
+                SHOPIFY_ACCESS_TOKEN = current_token
+                auth_refresh_done = True
+                logger.info("Retry GraphQL dopo refresh token per errore auth applicativo")
+                continue
+
+            if "errors" in data and data["errors"]:
+                log_error("GraphQL top-level errors", data["errors"])
+                raise HTTPException(status_code=502, detail="GraphQL top-level errors da Shopify")
+
+            return data
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            if attempt >= max_retries - 1:
+                log_error(
+                    "Errore chiamata Shopify GraphQL (ultimo tentativo)",
+                    {
+                        "error": str(e),
+                        "status": getattr(getattr(e, "response", None), "status_code", None),
+                    },
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Errore chiamata Shopify GraphQL: {e}",
+                ) from e
+
+            sleep_s = min(2 ** attempt, 30)
+            time.sleep(sleep_s)
+
+    raise HTTPException(status_code=502, detail="Errore Shopify non recuperabile")
+
+
+QUERY_PRODUCT_BY_CUSTOM_ID = """
+query ProductByCustomId($identifier: ProductIdentifierInput!) {
+  productByIdentifier(identifier: $identifier) {
+    id
+    title
+    status
+    variants(first: 5) {
+      nodes {
+        id
+        sku
+        barcode
+        inventoryPolicy
+        inventoryItem {
+          id
+          tracked
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+MUTATION_PRODUCT_SET_MINIMAL = """
+mutation ProductSetMinimal(
+  $identifier: ProductSetIdentifiers
+  $input: ProductSetInput!
+  $synchronous: Boolean!
+) {
+  productSet(identifier: $identifier, input: $input, synchronous: $synchronous) {
+    product {
+      id
+      title
+      status
+      variants(first: 5) {
+        nodes {
+          id
+          sku
+          barcode
+          inventoryPolicy
+          inventoryItem {
+            id
+            tracked
+          }
+        }
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+""".strip()
+
+
+# =========================================================
+# QUERY BUILDERS MIUR
 # =========================================================
 def build_province_query(regione: str) -> str:
     regione_safe = sparql_escape_string(regione_for_scuole_endpoint(regione).lower())
@@ -490,8 +806,9 @@ LIMIT {limit}
 OFFSET {offset}
 """.strip()
 
+
 # =========================================================
-# PARSERS
+# PARSERS MIUR
 # =========================================================
 def parse_single_count(bindings: List[Dict[str, Any]]) -> int:
     if not bindings:
@@ -586,12 +903,13 @@ def parse_libri(bindings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for item in bindings
     ]
 
+
 # =========================================================
-# FETCHERS
+# FETCHERS MIUR
 # =========================================================
 def fetch_province(regione: str) -> List[Dict[str, Any]]:
     endpoint = scuole_endpoint_for_regione(regione)
-    cache_key = build_cache_key("province", endpoint, regione)
+    cache_key = build_cache_key("province", endpoint, norm(regione))
     cached = cache_province.get(cache_key)
     if cached is not None:
         return cached
@@ -604,7 +922,7 @@ def fetch_province(regione: str) -> List[Dict[str, Any]]:
 
 def fetch_comuni(regione: str, provincia: str) -> List[Dict[str, Any]]:
     endpoint = scuole_endpoint_for_regione(regione)
-    cache_key = build_cache_key("comuni", endpoint, regione, provincia)
+    cache_key = build_cache_key("comuni", endpoint, norm(regione), norm(provincia))
     cached = cache_comuni.get(cache_key)
     if cached is not None:
         return cached
@@ -617,7 +935,15 @@ def fetch_comuni(regione: str, provincia: str) -> List[Dict[str, Any]]:
 
 def fetch_scuole(regione: str, provincia: str, comune: str, page: int, page_size: int) -> Dict[str, Any]:
     endpoint = scuole_endpoint_for_regione(regione)
-    cache_key = build_cache_key("scuole", endpoint, regione, provincia, comune, page, page_size)
+    cache_key = build_cache_key(
+        "scuole",
+        endpoint,
+        norm(regione),
+        norm(provincia),
+        norm(comune),
+        page,
+        page_size,
+    )
     cached = cache_scuole.get(cache_key)
     if cached is not None:
         return cached
@@ -649,7 +975,7 @@ def fetch_scuole(regione: str, provincia: str, comune: str, page: int, page_size
 
 def fetch_search_scuole(regione: str, q: str, page: int, page_size: int) -> Dict[str, Any]:
     endpoint = scuole_endpoint_for_regione(regione)
-    cache_key = build_cache_key("search", endpoint, regione, q.lower(), page, page_size)
+    cache_key = build_cache_key("search", endpoint, norm(regione), norm(q), page, page_size)
     cached = cache_search.get(cache_key)
     if cached is not None:
         return cached
@@ -680,7 +1006,7 @@ def fetch_search_scuole(regione: str, q: str, page: int, page_size: int) -> Dict
 
 
 def fetch_libri(regione: str, codicescuola: str) -> Dict[str, Any]:
-    cache_key = build_cache_key("libri", regione, codicescuola.upper())
+    cache_key = build_cache_key("libri", norm(regione), norm(codicescuola))
     cached = cache_libri.get(cache_key)
     if cached is not None:
         return cached
@@ -730,8 +1056,200 @@ def fetch_libri(regione: str, codicescuola: str) -> Dict[str, Any]:
     cache_libri.set(cache_key, result)
     return result
 
+
 # =========================================================
-# API
+# SHOPIFY REQUEST MODEL
+# =========================================================
+class ShopifyLibroCreateRequest(BaseModel):
+    isbn: str = Field(..., min_length=3, max_length=64)
+    titolo: str = Field(..., min_length=1, max_length=500)
+    autore: Optional[str] = Field(default="", max_length=255)
+    editore: Optional[str] = Field(default="", max_length=255)
+    categoria: Optional[str] = Field(default="Libro", max_length=255)
+    prezzo: Optional[float] = Field(default=0.0, ge=0)
+    sottotitolo: Optional[str] = Field(default="", max_length=500)
+    descrizione: Optional[str] = Field(default="", max_length=5000)
+    tags: Optional[List[str]] = None
+
+
+# =========================================================
+# SHOPIFY HELPERS
+# =========================================================
+def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> Dict[str, Any]:
+    isbn = payload.isbn.strip()
+    titolo = payload.titolo.strip()
+    autore = (payload.autore or "").strip()
+    editore = (payload.editore or "").strip()
+    categoria = (payload.categoria or "Libro").strip()
+    sottotitolo = (payload.sottotitolo or "").strip()
+    descrizione = (payload.descrizione or "").strip()
+
+    description_html_parts: List[str] = []
+    if sottotitolo:
+        description_html_parts.append(f"<p><strong>{html.escape(sottotitolo)}</strong></p>")
+    if descrizione:
+        description_html_parts.append(f"<p>{html.escape(descrizione)}</p>")
+
+    description_html = "".join(description_html_parts) if description_html_parts else "<p></p>"
+
+    tags = list(dict.fromkeys([t.strip() for t in (payload.tags or []) if t and t.strip()]))
+    if "libro" not in [t.lower() for t in tags]:
+        tags.append("libro")
+
+    metafields = [
+        {
+            "namespace": "custom",
+            "key": "autore",
+            "type": "single_line_text_field",
+            "value": autore or "Autore sconosciuto",
+        },
+        {
+            "namespace": "custom",
+            "key": "isbn",
+            "type": "single_line_text_field",
+            "value": isbn,
+        },
+        {
+            "namespace": "custom",
+            "key": "categoria",
+            "type": "single_line_text_field",
+            "value": categoria or "Libro",
+        },
+        {
+            "namespace": EXTERNAL_ID_NAMESPACE,
+            "key": EXTERNAL_ID_KEY,
+            "type": "id",
+            "value": isbn,
+        },
+    ]
+
+    return {
+        "title": titolo or f"Libro {isbn}",
+        "descriptionHtml": description_html,
+        "vendor": editore or "Editore non specificato",
+        "productType": categoria or "Libro",
+        "tags": tags,
+        "status": "ACTIVE",
+        "productOptions": [
+            {
+                "name": "Title",
+                "position": 1,
+                "values": [{"name": "Default Title"}],
+            }
+        ],
+        "variants": [
+            {
+                "sku": isbn,
+                "barcode": isbn,
+                "price": f"{float(payload.prezzo or 0.0):.2f}",
+                "inventoryPolicy": "CONTINUE",
+                "inventoryItem": {
+                    "tracked": False,
+                },
+                "optionValues": [
+                    {
+                        "optionName": "Title",
+                        "name": "Default Title",
+                    }
+                ],
+            }
+        ],
+        "metafields": metafields,
+    }
+
+
+def find_shopify_product_variant_by_external_id(external_id: str) -> Optional[Dict[str, Any]]:
+    cache_key = build_cache_key("shopify_lookup", norm(external_id))
+    cached = cache_shopify_lookup.get(cache_key)
+    if cached is not None:
+        return cached
+
+    variables = {
+        "identifier": {
+            "customId": {
+                "namespace": EXTERNAL_ID_NAMESPACE,
+                "key": EXTERNAL_ID_KEY,
+                "value": external_id,
+            }
+        }
+    }
+
+    data = shopify_graphql(QUERY_PRODUCT_BY_CUSTOM_ID, variables)
+    product = ((data.get("data") or {}).get("productByIdentifier")) or None
+    if not product:
+        return None
+
+    variants = (((product.get("variants") or {}).get("nodes")) or [])
+    variant = variants[0] if variants else None
+
+    result = {
+        "product_id": product.get("id"),
+        "variant_id": (variant or {}).get("id"),
+        "inventory_item_id": ((variant or {}).get("inventoryItem") or {}).get("id"),
+        "tracked": ((variant or {}).get("inventoryItem") or {}).get("tracked"),
+        "inventory_policy": (variant or {}).get("inventoryPolicy"),
+    }
+    cache_shopify_lookup.set(cache_key, result)
+    return result
+
+
+def create_minimal_shopify_product(payload: ShopifyLibroCreateRequest) -> Dict[str, Any]:
+    isbn = payload.isbn.strip()
+
+    variables = {
+        "synchronous": True,
+        "identifier": {
+            "customId": {
+                "namespace": EXTERNAL_ID_NAMESPACE,
+                "key": EXTERNAL_ID_KEY,
+                "value": isbn,
+            }
+        },
+        "input": build_minimal_shopify_product_input(payload),
+    }
+
+    data = shopify_graphql(MUTATION_PRODUCT_SET_MINIMAL, variables)
+    result = ((data.get("data") or {}).get("productSet")) or {}
+
+    user_errors = result.get("userErrors") or []
+    if user_errors:
+        log_error("Shopify productSet userErrors", user_errors)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Shopify productSet userErrors",
+                "errors": user_errors,
+            },
+        )
+
+    product = result.get("product") or {}
+    variants = (((product.get("variants") or {}).get("nodes")) or [])
+    variant = variants[0] if variants else None
+    variant_id = (variant or {}).get("id")
+
+    if not variant_id:
+        log_error("Prodotto creato ma variant_id non trovato", data)
+        raise HTTPException(
+            status_code=502,
+            detail="Prodotto creato ma variant_id non trovato nella risposta Shopify",
+        )
+
+    created = {
+        "created": True,
+        "product_id": product.get("id"),
+        "variant_id": variant_id,
+        "inventory_item_id": ((variant or {}).get("inventoryItem") or {}).get("id"),
+        "tracked": ((variant or {}).get("inventoryItem") or {}).get("tracked"),
+        "inventory_policy": (variant or {}).get("inventoryPolicy"),
+    }
+
+    cache_key = build_cache_key("shopify_lookup", norm(isbn))
+    cache_shopify_lookup.set(cache_key, created)
+    return created
+
+
+# =========================================================
+# API MIUR
 # =========================================================
 @app.get("/regioni")
 def get_regioni() -> Dict[str, List[str]]:
@@ -739,7 +1257,7 @@ def get_regioni() -> Dict[str, List[str]]:
 
 
 @app.get("/province")
-def get_province(regione: str = Query(...)) -> Dict[str, Any]:
+def get_province(regione: str = Query(..., max_length=100)) -> Dict[str, Any]:
     regione_norm = normalize_regione_input(regione)
     province = fetch_province(regione_norm)
     return {
@@ -752,8 +1270,8 @@ def get_province(regione: str = Query(...)) -> Dict[str, Any]:
 
 @app.get("/comuni")
 def get_comuni_api(
-    regione: str = Query(...),
-    provincia: str = Query(...),
+    regione: str = Query(..., max_length=100),
+    provincia: str = Query(..., max_length=100),
 ) -> Dict[str, Any]:
     regione_norm = normalize_regione_input(regione)
     provincia_input = require_not_blank(provincia, "provincia")
@@ -770,9 +1288,9 @@ def get_comuni_api(
 
 @app.get("/scuole")
 def get_scuole_api(
-    regione: str = Query(...),
-    provincia: str = Query(...),
-    comune: str = Query(...),
+    regione: str = Query(..., max_length=100),
+    provincia: str = Query(..., max_length=100),
+    comune: str = Query(..., max_length=150),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ) -> Dict[str, Any]:
@@ -792,8 +1310,8 @@ def get_scuole_api(
 
 @app.get("/scuole/search")
 def search_scuole_api(
-    regione: str = Query(...),
-    q: str = Query(..., min_length=2),
+    regione: str = Query(..., max_length=100),
+    q: str = Query(..., min_length=2, max_length=100),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ) -> Dict[str, Any]:
@@ -814,8 +1332,8 @@ def search_scuole_api(
 
 @app.get("/libri")
 def get_libri_api(
-    codicescuola: str = Query(..., description="Codice scuola"),
-    regione: str = Query(..., description="Nome regione"),
+    codicescuola: str = Query(..., description="Codice scuola", max_length=32),
+    regione: str = Query(..., description="Nome regione", max_length=100),
 ) -> Dict[str, Any]:
     codice_input = require_not_blank(codicescuola, "codicescuola")
     regione_norm = normalize_regione_input(regione)
@@ -835,6 +1353,53 @@ def get_libri_api(
     }
 
 
+# =========================================================
+# API SHOPIFY
+# =========================================================
+@app.post("/shopify/libri")
+def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[str, Any]:
+    isbn = require_not_blank(payload.isbn, "isbn")
+
+    existing = find_shopify_product_variant_by_external_id(isbn)
+    if existing and existing.get("variant_id"):
+        return {
+            "ok": True,
+            "created": False,
+            "isbn": isbn,
+            "variant_id": existing["variant_id"],
+            "product_id": existing.get("product_id"),
+            "inventory_item_id": existing.get("inventory_item_id"),
+            "tracked": existing.get("tracked"),
+            "inventory_policy": existing.get("inventory_policy"),
+        }
+
+    created = create_minimal_shopify_product(payload)
+    return {
+        "ok": True,
+        "created": True,
+        "isbn": isbn,
+        "variant_id": created["variant_id"],
+        "product_id": created.get("product_id"),
+        "inventory_item_id": created.get("inventory_item_id"),
+        "tracked": created.get("tracked"),
+        "inventory_policy": created.get("inventory_policy"),
+    }
+
+
+# =========================================================
+# HEALTH
+# =========================================================
 @app.get("/health")
-def health():
-    return {"ok-tutto apposto": True}
+def health() -> Dict[str, bool]:
+    return {"ok": True}
+
+
+# =========================================================
+# SHUTDOWN
+# =========================================================
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    try:
+        http_session.close()
+    except Exception:
+        pass

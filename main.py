@@ -1392,14 +1392,3 @@ def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[s
 @app.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
-
-
-# =========================================================
-# SHUTDOWN
-# =========================================================
-@app.on_event("shutdown")
-def shutdown_event() -> None:
-    try:
-        http_session.close()
-    except Exception:
-        pass

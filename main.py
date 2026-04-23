@@ -89,7 +89,7 @@ MIUR_OPENDATA_BASE = "https://dati.istruzione.it/opendata"
 
 HTTP_TIMEOUT = 60
 SPARQL_PAGE_SIZE = 1000
-USER_AGENT = "fastapi-scuole-libri/6.0"
+USER_AGENT = "fastapi-scuole-libri/7.0"
 
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
@@ -101,6 +101,11 @@ SHOPIFY_REFRESH_CLIENT_SECRET = os.getenv("SHOPIFY_REFRESH_CLIENT_SECRET", "").s
 
 EXTERNAL_ID_NAMESPACE = "custom"
 EXTERNAL_ID_KEY = "external_id"
+
+COVER_URL_TEMPLATE = os.getenv(
+    "COVER_URL_TEMPLATE",
+    "https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg",
+).strip()
 
 
 def env_csv(name: str, default: str = "") -> List[str]:
@@ -1138,6 +1143,10 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
     if "libro" not in [t.lower() for t in tags]:
         tags.append("libro")
 
+    cover_url = COVER_URL_TEMPLATE.format(isbn=isbn) if isbn else None
+    cover_filename = f"copertina-{isbn}.jpg" if isbn else "copertina.jpg"
+    cover_alt = f"Copertina del libro {titolo}".strip()
+
     variant_input: Dict[str, Any] = {
         "sku": isbn,
         "barcode": isbn,
@@ -1154,7 +1163,6 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
         ],
     }
 
-    # Se LOCATION_ID è presente, mantieni compatibilità col tuo setup.
     if SHOPIFY_LOCATION_ID:
         variant_input["inventoryQuantities"] = [
             {
@@ -1164,7 +1172,7 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
             }
         ]
 
-    return {
+    input_obj: Dict[str, Any] = {
         "title": titolo or f"Libro {isbn}",
         "descriptionHtml": description_html,
         "vendor": editore or "Editore non specificato",
@@ -1180,6 +1188,17 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
         ],
         "variants": [variant_input],
     }
+
+    if cover_url:
+        input_obj["files"] = [
+            {
+                "originalSource": cover_url,
+                "filename": cover_filename,
+                "alt": cover_alt,
+            }
+        ]
+
+    return input_obj
 
 
 def set_shopify_book_metafields(product_id: str, payload: ShopifyLibroCreateRequest) -> None:

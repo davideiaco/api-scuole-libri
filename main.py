@@ -94,7 +94,7 @@ MIUR_OPENDATA_BASE = "https://dati.istruzione.it/opendata"
 
 HTTP_TIMEOUT = 60
 SPARQL_PAGE_SIZE = 1000
-USER_AGENT = "fastapi-scuole-libri/4.0"
+USER_AGENT = "fastapi-scuole-libri/5.0"
 
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
@@ -595,6 +595,24 @@ mutation ProductSetMinimal(
 }
 """.strip()
 
+MUTATION_METAFIELDS_SET = """
+mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields {
+      id
+      namespace
+      key
+      value
+    }
+    userErrors {
+      field
+      message
+      code
+    }
+  }
+}
+""".strip()
+
 
 # =========================================================
 # QUERY BUILDERS MIUR
@@ -1078,7 +1096,6 @@ class ShopifyLibroCreateRequest(BaseModel):
 def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> Dict[str, Any]:
     isbn = payload.isbn.strip()
     titolo = payload.titolo.strip()
-    autore = (payload.autore or "").strip()
     editore = (payload.editore or "").strip()
     categoria = (payload.categoria or "Libro").strip()
     sottotitolo = (payload.sottotitolo or "").strip()
@@ -1095,33 +1112,6 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
     tags = list(dict.fromkeys([t.strip() for t in (payload.tags or []) if t and t.strip()]))
     if "libro" not in [t.lower() for t in tags]:
         tags.append("libro")
-
-    metafields = [
-        {
-            "namespace": "custom",
-            "key": "autore",
-            "type": "single_line_text_field",
-            "value": autore or "Autore sconosciuto",
-        },
-        {
-            "namespace": "custom",
-            "key": "isbn",
-            "type": "single_line_text_field",
-            "value": isbn,
-        },
-        {
-            "namespace": "custom",
-            "key": "categoria",
-            "type": "single_line_text_field",
-            "value": categoria or "Libro",
-        },
-        {
-            "namespace": EXTERNAL_ID_NAMESPACE,
-            "key": EXTERNAL_ID_KEY,
-            "type": "id",
-            "value": isbn,
-        },
-    ]
 
     return {
         "title": titolo or f"Libro {isbn}",
@@ -1154,8 +1144,60 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
                 ],
             }
         ],
-        "metafields": metafields,
     }
+
+
+def set_shopify_book_metafields(product_id: str, payload: ShopifyLibroCreateRequest) -> None:
+    isbn = payload.isbn.strip()
+    autore = (payload.autore or "").strip()
+    categoria = (payload.categoria or "Libro").strip()
+
+    variables = {
+        "metafields": [
+            {
+                "ownerId": product_id,
+                "namespace": "custom",
+                "key": "autore",
+                "type": "single_line_text_field",
+                "value": autore or "Autore sconosciuto",
+            },
+            {
+                "ownerId": product_id,
+                "namespace": "custom",
+                "key": "isbn",
+                "type": "single_line_text_field",
+                "value": isbn,
+            },
+            {
+                "ownerId": product_id,
+                "namespace": "custom",
+                "key": "categoria",
+                "type": "single_line_text_field",
+                "value": categoria,
+            },
+            {
+                "ownerId": product_id,
+                "namespace": EXTERNAL_ID_NAMESPACE,
+                "key": EXTERNAL_ID_KEY,
+                "type": "id",
+                "value": isbn,
+            },
+        ]
+    }
+
+    data = shopify_graphql(MUTATION_METAFIELDS_SET, variables)
+    result = ((data.get("data") or {}).get("metafieldsSet")) or {}
+    user_errors = result.get("userErrors") or []
+
+    if user_errors:
+        log_error("Shopify metafieldsSet userErrors", user_errors)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Shopify metafieldsSet userErrors",
+                "errors": user_errors,
+            },
+        )
 
 
 def find_shopify_product_variant_by_external_id(external_id: str) -> Optional[Dict[str, Any]]:
@@ -1223,20 +1265,23 @@ def create_minimal_shopify_product(payload: ShopifyLibroCreateRequest) -> Dict[s
         )
 
     product = result.get("product") or {}
+    product_id = product.get("id")
     variants = (((product.get("variants") or {}).get("nodes")) or [])
     variant = variants[0] if variants else None
     variant_id = (variant or {}).get("id")
 
-    if not variant_id:
-        log_error("Prodotto creato ma variant_id non trovato", data)
+    if not product_id or not variant_id:
+        log_error("Prodotto creato ma product_id o variant_id non trovati", data)
         raise HTTPException(
             status_code=502,
-            detail="Prodotto creato ma variant_id non trovato nella risposta Shopify",
+            detail="Prodotto creato ma product_id o variant_id non trovati nella risposta Shopify",
         )
+
+    set_shopify_book_metafields(product_id, payload)
 
     created = {
         "created": True,
-        "product_id": product.get("id"),
+        "product_id": product_id,
         "variant_id": variant_id,
         "inventory_item_id": ((variant or {}).get("inventoryItem") or {}).get("id"),
         "tracked": ((variant or {}).get("inventoryItem") or {}).get("tracked"),
@@ -1392,3 +1437,14 @@ def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[s
 @app.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
+
+
+# =========================================================
+# SHUTDOWN
+# =========================================================
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    try:
+        http_session.close()
+    except Exception:
+        pass

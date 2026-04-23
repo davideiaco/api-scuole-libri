@@ -348,6 +348,11 @@ def execute_sparql(endpoint: str, query: str) -> List[Dict[str, Any]]:
     payload = session_get_json(endpoint, params={"query": query})
     return extract_bindings(payload)
 
+def extract_shopify_numeric_id(gid: Optional[str]) -> Optional[str]:
+    if not gid:
+        return None
+    return gid.rsplit("/", 1)[-1].strip() or None
+
 
 # =========================================================
 # SHOPIFY TOKEN REFRESH
@@ -1226,7 +1231,7 @@ def find_shopify_product_variant_by_external_id(external_id: str) -> Optional[Di
 
     result = {
         "product_id": product.get("id"),
-        "variant_id": (variant or {}).get("id"),
+        "variant_id": extract_shopify_numeric_id((variant or {}).get("id")),
         "inventory_item_id": ((variant or {}).get("inventoryItem") or {}).get("id"),
         "tracked": ((variant or {}).get("inventoryItem") or {}).get("tracked"),
         "inventory_policy": (variant or {}).get("inventoryPolicy"),
@@ -1282,7 +1287,7 @@ def create_minimal_shopify_product(payload: ShopifyLibroCreateRequest) -> Dict[s
     created = {
         "created": True,
         "product_id": product_id,
-        "variant_id": variant_id,
+        "variant_id": extract_shopify_numeric_id(variant_id),
         "inventory_item_id": ((variant or {}).get("inventoryItem") or {}).get("id"),
         "tracked": ((variant or {}).get("inventoryItem") or {}).get("tracked"),
         "inventory_policy": (variant or {}).get("inventoryPolicy"),

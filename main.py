@@ -22,11 +22,6 @@ from pydantic import BaseModel, Field
 # PATH / ENV
 # =========================================================
 def get_app_dir() -> Path:
-    """
-    Restituisce la cartella applicazione:
-    - se script Python: cartella del file .py
-    - se eseguibile PyInstaller: cartella del file .exe
-    """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
@@ -94,7 +89,7 @@ MIUR_OPENDATA_BASE = "https://dati.istruzione.it/opendata"
 
 HTTP_TIMEOUT = 60
 SPARQL_PAGE_SIZE = 1000
-USER_AGENT = "fastapi-scuole-libri/5.0"
+USER_AGENT = "fastapi-scuole-libri/6.0"
 
 SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP", "").strip()
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "").strip()
@@ -106,6 +101,14 @@ SHOPIFY_REFRESH_CLIENT_SECRET = os.getenv("SHOPIFY_REFRESH_CLIENT_SECRET", "").s
 
 EXTERNAL_ID_NAMESPACE = "custom"
 EXTERNAL_ID_KEY = "external_id"
+
+
+def env_csv(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default).strip()
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+PUBLICATION_IDS = env_csv("SHOPIFY_PUBLICATION_IDS", "")
 
 
 # =========================================================
@@ -321,6 +324,12 @@ def extract_bindings(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return payload.get("results", {}).get("bindings", [])
 
 
+def extract_shopify_numeric_id(gid: Optional[str]) -> Optional[str]:
+    if not gid:
+        return None
+    return gid.rsplit("/", 1)[-1].strip() or None
+
+
 def session_get_json(url: str, *, params: Dict[str, str]) -> Dict[str, Any]:
     try:
         response = http_session.get(
@@ -347,11 +356,6 @@ def session_get_json(url: str, *, params: Dict[str, str]) -> Dict[str, Any]:
 def execute_sparql(endpoint: str, query: str) -> List[Dict[str, Any]]:
     payload = session_get_json(endpoint, params={"query": query})
     return extract_bindings(payload)
-
-def extract_shopify_numeric_id(gid: Optional[str]) -> Optional[str]:
-    if not gid:
-        return None
-    return gid.rsplit("/", 1)[-1].strip() or None
 
 
 # =========================================================
@@ -613,6 +617,22 @@ mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
       field
       message
       code
+    }
+  }
+}
+""".strip()
+
+MUTATION_PUBLISHABLE_PUBLISH = """
+mutation PublishProduct($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    publishable {
+      ... on Product {
+        id
+      }
+    }
+    userErrors {
+      field
+      message
     }
   }
 }
@@ -1118,6 +1138,32 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
     if "libro" not in [t.lower() for t in tags]:
         tags.append("libro")
 
+    variant_input: Dict[str, Any] = {
+        "sku": isbn,
+        "barcode": isbn,
+        "price": f"{float(payload.prezzo or 0.0):.2f}",
+        "inventoryPolicy": "CONTINUE",
+        "inventoryItem": {
+            "tracked": False,
+        },
+        "optionValues": [
+            {
+                "optionName": "Title",
+                "name": "Default Title",
+            }
+        ],
+    }
+
+    # Se LOCATION_ID è presente, mantieni compatibilità col tuo setup.
+    if SHOPIFY_LOCATION_ID:
+        variant_input["inventoryQuantities"] = [
+            {
+                "locationId": SHOPIFY_LOCATION_ID,
+                "name": "available",
+                "quantity": 0,
+            }
+        ]
+
     return {
         "title": titolo or f"Libro {isbn}",
         "descriptionHtml": description_html,
@@ -1132,23 +1178,7 @@ def build_minimal_shopify_product_input(payload: ShopifyLibroCreateRequest) -> D
                 "values": [{"name": "Default Title"}],
             }
         ],
-        "variants": [
-            {
-                "sku": isbn,
-                "barcode": isbn,
-                "price": f"{float(payload.prezzo or 0.0):.2f}",
-                "inventoryPolicy": "CONTINUE",
-                "inventoryItem": {
-                    "tracked": False,
-                },
-                "optionValues": [
-                    {
-                        "optionName": "Title",
-                        "name": "Default Title",
-                    }
-                ],
-            }
-        ],
+        "variants": [variant_input],
     }
 
 
@@ -1200,6 +1230,30 @@ def set_shopify_book_metafields(product_id: str, payload: ShopifyLibroCreateRequ
             status_code=502,
             detail={
                 "message": "Shopify metafieldsSet userErrors",
+                "errors": user_errors,
+            },
+        )
+
+
+def publish_shopify_product(product_id: str) -> None:
+    if not PUBLICATION_IDS:
+        return
+
+    variables = {
+        "id": product_id,
+        "input": [{"publicationId": pub_id} for pub_id in PUBLICATION_IDS],
+    }
+
+    data = shopify_graphql(MUTATION_PUBLISHABLE_PUBLISH, variables)
+    result = ((data.get("data") or {}).get("publishablePublish")) or {}
+    user_errors = result.get("userErrors") or []
+
+    if user_errors:
+        log_error("Shopify publishablePublish userErrors", user_errors)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Shopify publishablePublish userErrors",
                 "errors": user_errors,
             },
         )
@@ -1273,9 +1327,9 @@ def create_minimal_shopify_product(payload: ShopifyLibroCreateRequest) -> Dict[s
     product_id = product.get("id")
     variants = (((product.get("variants") or {}).get("nodes")) or [])
     variant = variants[0] if variants else None
-    variant_id = (variant or {}).get("id")
+    variant_gid = (variant or {}).get("id")
 
-    if not product_id or not variant_id:
+    if not product_id or not variant_gid:
         log_error("Prodotto creato ma product_id o variant_id non trovati", data)
         raise HTTPException(
             status_code=502,
@@ -1283,11 +1337,12 @@ def create_minimal_shopify_product(payload: ShopifyLibroCreateRequest) -> Dict[s
         )
 
     set_shopify_book_metafields(product_id, payload)
+    publish_shopify_product(product_id)
 
     created = {
         "created": True,
         "product_id": product_id,
-        "variant_id": extract_shopify_numeric_id(variant_id),
+        "variant_id": extract_shopify_numeric_id(variant_gid),
         "inventory_item_id": ((variant or {}).get("inventoryItem") or {}).get("id"),
         "tracked": ((variant or {}).get("inventoryItem") or {}).get("tracked"),
         "inventory_policy": (variant or {}).get("inventoryPolicy"),

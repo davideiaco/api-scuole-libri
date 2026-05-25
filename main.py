@@ -1557,11 +1557,6 @@ def seo_book_page(isbn: str):
       <p>ISBN/EAN: {html.escape(isbn)}</p>
       <p>Editore: {editore}</p>
       <img src="{image}" alt="{titolo}" style="max-width:180px">
-
-      <form class="dynamic-add-to-cart">
-        <input type="hidden" name="isbn" value="{html.escape(isbn)}">
-        <button type="submit">Aggiungi al carrello</button>
-      </form>
     </main>
     """
 

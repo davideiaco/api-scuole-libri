@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from fastapi.responses import HTMLResponse
 
 
 # =========================================================
@@ -1508,6 +1509,61 @@ def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[s
         "tracked": created.get("tracked"),
         "inventory_policy": created.get("inventory_policy"),
     }
+
+
+
+@app.get("/libro/{isbn}", response_class=HTMLResponse)
+def seo_book_page(isbn: str):
+    # libro = find_book_by_isbn(isbn)  # da implementare: DB/cache/API tua
+
+    # if not libro:
+    #     raise HTTPException(status_code=404, detail="Libro non trovato")
+
+    titolo = 'Custodi di bellezza' # html.escape(libro.get("titolo", f"Libro {isbn}"))
+    editore = 'Marietti Scuola' # html.escape(libro.get("editore", ""))
+    prezzo = 10 # libro.get("prezzo", "0.00")
+    image = f"https://www.ibs.it/images/{html.escape(isbn)}_0_0_0_0_0.jpg"
+    url = f"https://didalibri.com/pages/libro?isbn={html.escape(isbn)}"
+
+    json_ld = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": "TITOLONE", # libro.get("titolo", f"Libro {isbn}"),
+        # "image": image,
+        "gtin13": isbn,
+        "isbn": isbn,
+        "brand": {
+            "@type": "Brand",
+            "name": editore, # libro.get("editore", "")
+        },
+        "offers": {
+            "@type": "Offer",
+            "priceCurrency": "EUR",
+            "price": prezzo,
+            "availability": "https://schema.org/InStock",
+            "url": url
+        }
+    }
+
+    return f"""
+    <main style="max-width:900px;margin:40px auto;padding:20px;">
+      <title>{titolo} - ISBN {html.escape(isbn)}</title>
+      <link rel="canonical" href="{url}">
+      <script type="application/ld+json">
+        {json.dumps(json_ld, ensure_ascii=False)}
+      </script>
+
+      <h1>{titolo}</h1>
+      <p>ISBN/EAN: {html.escape(isbn)}</p>
+      <p>Editore: {editore}</p>
+      <img src="{image}" alt="{titolo}" style="max-width:180px">
+
+      <form class="dynamic-add-to-cart">
+        <input type="hidden" name="isbn" value="{html.escape(isbn)}">
+        <button type="submit">Aggiungi al carrello</button>
+      </form>
+    </main>
+    """
 
 
 # =========================================================

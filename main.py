@@ -1560,9 +1560,9 @@ def seo_book_page(isbn: str):
             detail=f"Libro con ISBN {isbn} non trovato"
         )
 
-    titolo = html.escape(libro["titolo"])
-    autore = html.escape(libro.get("autore", ""))
-    editore = html.escape(libro.get("editore", ""))
+    titolo = html.escape(libro.get("titolo") or f"Libro {isbn}")
+    autore = html.escape(libro.get("autore") or "")
+    editore = html.escape(libro.get("editore") or "")
     descrizione = html.escape(
         libro.get(
             "descrizione",
@@ -1647,11 +1647,11 @@ def seo_book_page(isbn: str):
         """
 
 def find_book_by_isbn(isbn: str) -> Optional[dict]:
+    isbn = require_not_blank(isbn, "isbn")
 
-    cache_key = build_cache_key("book", isbn)
-
+    cache_key = build_cache_key("book_by_isbn", norm(isbn))
     cached = cache_libri.get(cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     variables = {
@@ -1659,59 +1659,45 @@ def find_book_by_isbn(isbn: str) -> Optional[dict]:
             "customId": {
                 "namespace": EXTERNAL_ID_NAMESPACE,
                 "key": EXTERNAL_ID_KEY,
-                "value": isbn
+                "value": isbn,
             }
         }
     }
 
-    data = shopify_graphql(
-        QUERY_BOOK_BY_ISBN,
-        variables
-    )
+    data = shopify_graphql(QUERY_BOOK_BY_ISBN, variables)
 
-    product = (
-        data.get("data", {})
-        .get("productByIdentifier")
-    )
-
+    product = (data.get("data") or {}).get("productByIdentifier")
     if not product:
         return None
 
-    metafields = {
-        mf["key"]: mf["value"]
-        for mf in product.get("metafields", [])
-        if mf
-    }
+    metafields = {}
+    for mf in product.get("metafields") or []:
+        if mf and mf.get("key"):
+            metafields[mf["key"]] = mf.get("value", "")
 
-    image = (
-        product.get("featuredMedia", {})
-        .get("preview", {})
-        .get("image", {})
-        .get("url")
-    )
+    featured_media = product.get("featuredMedia") or {}
+    preview = featured_media.get("preview") or {}
+    image_obj = preview.get("image") or {}
+    image = image_obj.get("url") or f"https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg"
 
-    variant = (
-        product.get("variants", {})
-        .get("nodes", [{}])[0]
-    )
+    variants = ((product.get("variants") or {}).get("nodes") or [])
+    variant = variants[0] if variants else {}
+
+    description_html = product.get("descriptionHtml") or ""
+    descrizione = re.sub("<[^<]+?>", "", description_html).strip()
 
     libro = {
-        "id": product["id"],
+        "id": product.get("id"),
         "isbn": metafields.get("isbn", isbn),
-        "titolo": product["title"],
+        "titolo": product.get("title") or f"Libro {isbn}",
         "autore": metafields.get("autore", ""),
-        "editore": product.get("vendor", ""),
-        "descrizione": re.sub(
-            "<[^<]+?>",
-            "",
-            product.get("descriptionHtml", "")
-        ),
-        "prezzo": variant.get("price", "0.00"),
+        "editore": product.get("vendor") or "",
+        "descrizione": descrizione,
+        "prezzo": variant.get("price") or "0.00",
         "image": image,
     }
 
     cache_libri.set(cache_key, libro)
-
     return libro
 
 # =========================================================

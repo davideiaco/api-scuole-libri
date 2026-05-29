@@ -1575,7 +1575,6 @@ def seo_book_page(isbn: str):
         "@type": "Book",
         "name": libro.get("titolo") or f"Libro {isbn}",
         "isbn": isbn,
-        "image": image,
         "author": {
             "@type": "Person",
             "name": libro.get("autore") or "",

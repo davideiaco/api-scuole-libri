@@ -644,6 +644,41 @@ mutation PublishProduct($id: ID!, $input: [PublicationInput!]!) {
 }
 """.strip()
 
+QUERY_BOOK_BY_ISBN = """
+query ProductByISBN($identifier: ProductIdentifierInput!) {
+  productByIdentifier(identifier: $identifier) {
+    id
+    title
+    descriptionHtml
+    vendor
+
+    featuredMedia {
+      preview {
+        image {
+          url
+        }
+      }
+    }
+
+    metafields(
+      identifiers: [
+        {namespace: "custom", key: "autore"}
+        {namespace: "custom", key: "isbn"}
+      ]
+    ) {
+      key
+      value
+    }
+
+    variants(first: 1) {
+      nodes {
+        price
+      }
+    }
+  }
+}
+"""
+
 
 # =========================================================
 # QUERY BUILDERS MIUR
@@ -1514,52 +1549,170 @@ def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[s
 
 @app.get("/libro/{isbn}", response_class=HTMLResponse)
 def seo_book_page(isbn: str):
-    # libro = find_book_by_isbn(isbn)  # da implementare: DB/cache/API tua
 
-    # if not libro:
-    #     raise HTTPException(status_code=404, detail="Libro non trovato")
+    isbn = require_not_blank(isbn, "isbn")
 
-    titolo = 'Custodi di bellezza' # html.escape(libro.get("titolo", f"Libro {isbn}"))
-    editore = 'Marietti Scuola' # html.escape(libro.get("editore", ""))
-    prezzo = 10 # libro.get("prezzo", "0.00")
-    image = f"https://www.ibs.it/images/{html.escape(isbn)}_0_0_0_0_0.jpg"
-    url = f"https://didalibri.com/pages/libro?isbn={html.escape(isbn)}"
+    libro = find_book_by_isbn(isbn)
+
+    if not libro:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Libro con ISBN {isbn} non trovato"
+        )
+
+    titolo = html.escape(libro["titolo"])
+    autore = html.escape(libro.get("autore", ""))
+    editore = html.escape(libro.get("editore", ""))
+    descrizione = html.escape(
+        libro.get(
+            "descrizione",
+            f"Acquista {titolo} al miglior prezzo."
+        )
+    )
+
+    prezzo = libro.get("prezzo", 0)
+
+    image = libro.get(
+        "image",
+        f"https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg"
+    )
+
+    url = f"https://didalibri.com/libro/{isbn}"
 
     json_ld = {
         "@context": "https://schema.org",
-        "@type": "Product",
-        "name": "TITOLONE", # libro.get("titolo", f"Libro {isbn}"),
-        # "image": image,
-        "gtin13": isbn,
+        "@type": "Book",
+        "name": libro["titolo"],
+        "author": {
+            "@type": "Person",
+            "name": libro.get("autore", "")
+        },
         "isbn": isbn,
-        "brand": {
-            "@type": "Brand",
-            "name": editore, # libro.get("editore", "")
+        "image": image,
+        "publisher": {
+            "@type": "Organization",
+            "name": libro.get("editore", "")
         },
         "offers": {
             "@type": "Offer",
             "priceCurrency": "EUR",
-            "price": prezzo,
+            "price": str(prezzo),
             "availability": "https://schema.org/InStock",
             "url": url
         }
     }
 
     return f"""
-    <main style="max-width:900px;margin:40px auto;padding:20px;">
-      <title>{titolo} - ISBN {html.escape(isbn)}</title>
-      <link rel="canonical" href="{url}">
-      <script type="application/ld+json">
+        <!DOCTYPE html>
+        <html lang="it">
+        <head>
+        <meta charset="utf-8">
+
+        <title>{titolo} | DidaLibri</title>
+
+        <meta name="description" content="{descrizione}">
+        <link rel="canonical" href="{url}">
+
+        <meta property="og:type" content="book">
+        <meta property="og:title" content="{titolo}">
+        <meta property="og:description" content="{descrizione}">
+        <meta property="og:image" content="{image}">
+        <meta property="og:url" content="{url}">
+
+        <script type="application/ld+json">
         {json.dumps(json_ld, ensure_ascii=False)}
-      </script>
+        </script>
+        </head>
 
-      <h1>{titolo}</h1>
-      <p>ISBN/EAN: {html.escape(isbn)}</p>
-      <p>Editore: {editore}</p>
-      <img src="{image}" alt="{titolo}" style="max-width:180px">
-    </main>
-    """
+        <body>
+        <main style="max-width:900px;margin:40px auto;padding:20px;">
+            <h1>{titolo}</h1>
 
+            <img
+                src="{image}"
+                alt="{titolo}"
+                width="220"
+                loading="lazy"
+            >
+
+            <p><strong>ISBN:</strong> {isbn}</p>
+            <p><strong>Autore:</strong> {autore}</p>
+            <p><strong>Editore:</strong> {editore}</p>
+            <p><strong>Prezzo:</strong> € {prezzo}</p>
+
+            <p>{descrizione}</p>
+        </main>
+        </body>
+        </html>
+        """
+
+def find_book_by_isbn(isbn: str) -> Optional[dict]:
+
+    cache_key = build_cache_key("book", isbn)
+
+    cached = cache_libri.get(cache_key)
+    if cached:
+        return cached
+
+    variables = {
+        "identifier": {
+            "customId": {
+                "namespace": EXTERNAL_ID_NAMESPACE,
+                "key": EXTERNAL_ID_KEY,
+                "value": isbn
+            }
+        }
+    }
+
+    data = shopify_graphql(
+        QUERY_BOOK_BY_ISBN,
+        variables
+    )
+
+    product = (
+        data.get("data", {})
+        .get("productByIdentifier")
+    )
+
+    if not product:
+        return None
+
+    metafields = {
+        mf["key"]: mf["value"]
+        for mf in product.get("metafields", [])
+        if mf
+    }
+
+    image = (
+        product.get("featuredMedia", {})
+        .get("preview", {})
+        .get("image", {})
+        .get("url")
+    )
+
+    variant = (
+        product.get("variants", {})
+        .get("nodes", [{}])[0]
+    )
+
+    libro = {
+        "id": product["id"],
+        "isbn": metafields.get("isbn", isbn),
+        "titolo": product["title"],
+        "autore": metafields.get("autore", ""),
+        "editore": product.get("vendor", ""),
+        "descrizione": re.sub(
+            "<[^<]+?>",
+            "",
+            product.get("descriptionHtml", "")
+        ),
+        "prezzo": variant.get("price", "0.00"),
+        "image": image,
+    }
+
+    cache_libri.set(cache_key, libro)
+
+    return libro
 
 # =========================================================
 # HEALTH

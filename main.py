@@ -10,13 +10,14 @@ import time
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 
 # =========================================================
@@ -108,6 +109,8 @@ COVER_URL_TEMPLATE = os.getenv(
     "https://www.ibs.it/images/{isbn}_0_0_0_0_0.jpg",
 ).strip()
 
+SITE_BASE_URL = os.getenv("SITE_BASE_URL", "https://didalibri.com").strip().rstrip("/")
+
 
 def env_csv(name: str, default: str = "") -> List[str]:
     raw = os.getenv(name, default).strip()
@@ -165,6 +168,7 @@ cache_scuole = TTLCache(ttl_seconds=24 * 3600, max_items=8192)
 cache_search = TTLCache(ttl_seconds=6 * 3600, max_items=4096)
 cache_libri = TTLCache(ttl_seconds=24 * 3600, max_items=8192)
 cache_shopify_lookup = TTLCache(ttl_seconds=6 * 3600, max_items=4096)
+cache_sitemap_libri = TTLCache(ttl_seconds=24 * 3600, max_items=4)
 
 
 # =========================================================
@@ -891,6 +895,23 @@ OFFSET {offset}
 """.strip()
 
 
+def build_sitemap_isbn_query(limit: int, offset: int) -> str:
+    return f"""
+PREFIX miur: <http://www.miur.it/ns/miur#>
+
+SELECT DISTINCT ?CodiceISBN
+WHERE {{
+  GRAPH ?g {{
+    ?S miur:CODICEISBN ?CodiceISBN .
+    FILTER (str(?CodiceISBN) != "")
+  }}
+}}
+ORDER BY ?CodiceISBN
+LIMIT {limit}
+OFFSET {offset}
+""".strip()
+
+
 # =========================================================
 # PARSERS MIUR
 # =========================================================
@@ -986,6 +1007,15 @@ def parse_libri(bindings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         }
         for item in bindings
     ]
+
+
+def parse_isbns(bindings: List[Dict[str, Any]]) -> List[str]:
+    isbns: List[str] = []
+    for item in bindings:
+        isbn = normalize_spaces(binding_value(item, "CodiceISBN"))
+        if isbn:
+            isbns.append(isbn)
+    return isbns
 
 
 # =========================================================
@@ -1138,6 +1168,53 @@ def fetch_libri(regione: str, codicescuola: str) -> Dict[str, Any]:
         "libri": all_rows,
     }
     cache_libri.set(cache_key, result)
+    return result
+
+
+def fetch_sitemap_libri_isbns() -> List[str]:
+    cache_key = "sitemap_libri_isbns"
+    cached = cache_sitemap_libri.get(cache_key)
+    if cached is not None:
+        return cached
+
+    all_isbns: set[str] = set()
+    failed_datasets: List[str] = []
+
+    for regione, dataset_name in ALT_DATASET_BY_REGION.items():
+        endpoint = f"{MIUR_OPENDATA_BASE}/{dataset_name}/query"
+        offset = 0
+
+        while True:
+            query = build_sitemap_isbn_query(limit=SPARQL_PAGE_SIZE, offset=offset)
+
+            try:
+                bindings = execute_sparql(endpoint, query)
+            except HTTPException as exc:
+                failed_datasets.append(f"{regione}/{dataset_name}: {exc.detail}")
+                break
+
+            isbns = parse_isbns(bindings)
+            if not isbns:
+                break
+
+            all_isbns.update(isbns)
+
+            if len(isbns) < SPARQL_PAGE_SIZE:
+                break
+
+            offset += SPARQL_PAGE_SIZE
+
+    if not all_isbns and failed_datasets:
+        raise HTTPException(
+            status_code=502,
+            detail="Impossibile generare la sitemap libri dai dataset MIUR",
+        )
+
+    if failed_datasets:
+        log_error("Alcuni dataset MIUR libri non sono stati letti per la sitemap", failed_datasets)
+
+    result = sorted(all_isbns)
+    cache_sitemap_libri.set(cache_key, result)
     return result
 
 
@@ -1545,6 +1622,30 @@ def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[s
         "inventory_policy": created.get("inventory_policy"),
     }
 
+
+
+@app.get("/sitemap-libri.xml", response_class=Response)
+def sitemap_libri_xml(request: Request) -> Response:
+    base_url = SITE_BASE_URL or str(request.base_url).rstrip("/")
+    isbns = fetch_sitemap_libri_isbns()
+
+    url_entries = []
+    for isbn in isbns:
+        loc = f"{base_url}/libro/{quote(isbn, safe='')}"
+        url_entries.append(
+            "  <url>\n"
+            f"    <loc>{html.escape(loc, quote=True)}</loc>\n"
+            "  </url>"
+        )
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        + "\n".join(url_entries)
+        + "\n</urlset>\n"
+    )
+
+    return Response(content=xml, media_type="application/xml; charset=utf-8")
 
 
 @app.get("/libro/{isbn}", response_class=HTMLResponse)

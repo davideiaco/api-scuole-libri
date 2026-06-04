@@ -2024,67 +2024,76 @@ def create_or_get_shopify_book_api(payload: ShopifyLibroCreateRequest) -> Dict[s
 
 
 
+
+
+def xml_response(xml: str, *, cache_seconds: int = 86400, headers: Optional[Dict[str, str]] = None) -> Response:
+    response_headers = {"Cache-Control": f"public, max-age={cache_seconds}"}
+    if headers:
+        response_headers.update(headers)
+    return Response(
+        content=xml,
+        media_type="application/xml; charset=utf-8",
+        headers=response_headers,
+    )
+
+
+def build_sitemap_index_xml(locs: List[str]) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+    for loc in locs:
+        lines.append("  <sitemap>")
+        lines.append(f"    <loc>{html.escape(loc, quote=True)}</loc>")
+        lines.append("  </sitemap>")
+    lines.append("</sitemapindex>")
+    return "\n".join(lines) + "\n"
+
+
 @app.get("/sitemap-libri.xml")
-def sitemap_libri_xml() -> FileResponse:
+def sitemap_libri_xml() -> Response:
     """
-    Serve il sitemap index già generato su disco.
+    Sitemap index principale, generato dinamicamente e molto leggero.
 
-    IMPORTANTE: questo endpoint non legge i dataset MIUR al volo.
-    Con milioni di libri la generazione deve essere fatta fuori dalla richiesta HTTP,
-    ad esempio con cron:
-
-        python main.py generate-sitemap-libri
+    Non legge milioni di libri e non dipende da file XML su disco.
+    Contiene solo una sitemap per regione:
+      /sitemap-libri-regioni/{regione}.xml
     """
-    sitemap_path = SITEMAP_DIR / SITEMAP_INDEX_FILENAME
-    if not sitemap_path.exists():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Sitemap libri non ancora generata. "
-                "Esegui: python main.py generate-sitemap-libri"
-            ),
-        )
+    locs = []
+    for regione in REGIONI_CANONICHE:
+        regione_slug = slugify_sitemap_part(regione)
+        locs.append(f"{PUBLIC_APP_BASE_URL}/{SITEMAP_REGION_DIRNAME}/{regione_slug}.xml")
 
-    return FileResponse(
-        path=sitemap_path,
-        media_type="application/xml; charset=utf-8",
-        filename=SITEMAP_INDEX_FILENAME,
-    )
-
-
-@app.get("/sitemap-libri-{page}.xml")
-def sitemap_libri_page_xml(page: int) -> FileResponse:
-    """Serve una pagina sitemap già generata, massimo 50.000 URL."""
-    if page < 1:
-        raise HTTPException(status_code=404, detail="Sitemap non trovata")
-
-    filename = SITEMAP_PAGE_FILENAME_TEMPLATE.format(page=page)
-    sitemap_path = SITEMAP_DIR / filename
-
-    if not sitemap_path.exists():
-        raise HTTPException(status_code=404, detail="Sitemap non trovata")
-
-    return FileResponse(
-        path=sitemap_path,
-        media_type="application/xml; charset=utf-8",
-        filename=filename,
-    )
+    xml = build_sitemap_index_xml(locs)
+    return xml_response(xml, headers={"X-Sitemap-Level": "regioni", "X-Sitemap-Count": str(len(locs))})
 
 
 @app.get("/sitemap-libri-regioni/{regione_slug}.xml")
-def sitemap_libri_regione_xml(regione_slug: str) -> FileResponse:
-    """Serve l'index delle sitemap scuola per una regione."""
+def sitemap_libri_regione_xml(regione_slug: str) -> Response:
+    """
+    Sitemap index della singola regione.
+
+    Recupera dinamicamente dal MIUR i codici scuola della regione e restituisce
+    una sitemap per ogni scuola:
+      /sitemap-libri-scuola/{codice_scuola}.xml?regione={REGIONE}
+    """
     regione = regione_from_slug(regione_slug)
-    filename = SITEMAP_REGION_FILENAME_TEMPLATE.format(regione_slug=slugify_sitemap_part(regione))
-    sitemap_path = SITEMAP_DIR / SITEMAP_REGION_DIRNAME / filename
+    codici_scuola = fetch_sitemap_scuole_by_region(regione)
 
-    if not sitemap_path.exists():
-        raise HTTPException(status_code=404, detail="Sitemap regione non trovata")
+    locs = []
+    school_dir_url = f"{PUBLIC_APP_BASE_URL}/{SITEMAP_SCHOOL_DIRNAME}"
+    for codice_scuola in codici_scuola:
+        codice = normalize_codice_scuola_for_filename(codice_scuola)
+        locs.append(f"{school_dir_url}/{codice}.xml?regione={quote(regione, safe='')}")
 
-    return FileResponse(
-        path=sitemap_path,
-        media_type="application/xml; charset=utf-8",
-        filename=filename,
+    xml = build_sitemap_index_xml(locs)
+    return xml_response(
+        xml,
+        headers={
+            "X-Sitemap-Level": "scuole",
+            "X-Sitemap-Region": regione,
+            "X-Sitemap-Count": str(len(locs)),
+        },
     )
 
 
@@ -2098,28 +2107,28 @@ def sitemap_libri_scuola_xml(
     ),
 ) -> Response:
     """
-    Produce dinamicamente la sitemap dei libri di una singola scuola.
+    Sitemap finale della singola scuola.
 
-    Non legge file XML da disco: fa una chiamata al dataset MIUR ALT della regione.
-    Se la regione non viene passata, prova i dataset regionali finché trova ISBN.
+    Produce dinamicamente la lista degli URL:
+      /libro/{isbn}
+
+    Non legge file XML da disco: interroga MIUR al momento.
+    Se la regione viene passata in query string, interroga solo il dataset corretto.
     """
     try:
         codice = normalize_codice_scuola_for_filename(codice_scuola)
         regione_norm = normalize_regione_input(regione) if regione else None
     except ValueError:
-        raise HTTPException(status_code=404, detail="Codice scuola non valido")
+        raise HTTPException(status_code=404, detail="Codice scuola o regione non validi")
 
     payload = fetch_sitemap_school_isbns_dynamic(codice, regione=regione_norm)
     isbns = payload.get("isbns", [])
 
-    # Sitemap vuota valida: Google la può leggere senza mandare in errore l'intero index.
     xml = build_school_books_sitemap_xml(codice, isbns, PUBLIC_APP_BASE_URL)
-    return Response(
-        content=xml,
-        media_type="application/xml; charset=utf-8",
+    return xml_response(
+        xml,
         headers={
-            # Cache lato browser/CDN/proxy: evita di martellare MIUR se Google richiama spesso.
-            "Cache-Control": "public, max-age=86400",
+            "X-Sitemap-Level": "libri-scuola",
             "X-Sitemap-Book-Count": str(len(isbns)),
             "X-Sitemap-School-Code": codice,
         },

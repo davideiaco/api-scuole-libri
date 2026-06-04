@@ -1342,7 +1342,7 @@ def build_school_books_sitemap_xml(codice_scuola: str, isbns: List[str], base_ur
     ]
 
     for isbn in sorted(set(isbns)):
-        loc = f"{base_url.rstrip('/')}/libro/{quote(isbn, safe='')}"
+        loc = f"https://www.didalibri.com/pages/libro?isbn={quote(isbn, safe='')}"
         lines.append("  <url>")
         lines.append(f"    <loc>{html.escape(loc, quote=True)}</loc>")
         lines.append("  </url>")

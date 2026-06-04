@@ -954,6 +954,31 @@ OFFSET {offset}
 """.strip()
 
 
+def build_libri_isbn_query(codicescuola: str, limit: int, offset: int) -> str:
+    """
+    Query leggera per sitemap scuola: recupera solo gli ISBN distinti della scuola,
+    senza scaricare tutti i metadati dei libri.
+    """
+    codice_safe = sparql_escape_string(codicescuola.strip().lower())
+    return f"""
+PREFIX miur: <http://www.miur.it/ns/miur#>
+
+SELECT DISTINCT ?CodiceISBN
+WHERE {{
+  GRAPH ?g {{
+    ?S miur:CODICESCUOLA ?CodiceScuola .
+    ?S miur:CODICEISBN ?CodiceISBN .
+
+    FILTER (lcase(str(?CodiceScuola)) = "{codice_safe}")
+    FILTER (str(?CodiceISBN) != "")
+  }}
+}}
+ORDER BY ?CodiceISBN
+LIMIT {limit}
+OFFSET {offset}
+""".strip()
+
+
 def build_sitemap_isbn_query(limit: int, offset: int) -> str:
     return f"""
 PREFIX miur: <http://www.miur.it/ns/miur#>
@@ -1239,6 +1264,93 @@ def fetch_libri(regione: str, codicescuola: str) -> Dict[str, Any]:
     return result
 
 
+def fetch_sitemap_school_isbns_dynamic(codicescuola: str, regione: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Recupera dinamicamente dal MIUR gli ISBN di una singola scuola.
+
+    Se `regione` è presente interroga solo il dataset ALT della regione.
+    Se `regione` non è presente prova tutti i dataset regionali finché trova ISBN.
+    Il risultato viene cacheizzato per evitare chiamate ripetute al MIUR.
+    """
+    codice = normalize_codice_scuola_for_filename(codicescuola)
+    regioni_da_provare = [normalize_regione_input(regione)] if regione else list(REGIONI_CANONICHE)
+
+    cache_key = build_cache_key("sitemap_school_isbns_dynamic", codice, *(norm(r) for r in regioni_da_provare))
+    cached = cache_sitemap_libri.get(cache_key)
+    if cached is not None:
+        return cached
+
+    errori: List[str] = []
+
+    for regione_norm in regioni_da_provare:
+        dataset_name = ALT_DATASET_BY_REGION.get(regione_norm)
+        if not dataset_name:
+            continue
+
+        endpoint = f"{MIUR_OPENDATA_BASE}/{dataset_name}/query"
+        isbns: List[str] = []
+        offset = 0
+
+        while True:
+            query = build_libri_isbn_query(codicescuola=codice, limit=SPARQL_PAGE_SIZE, offset=offset)
+
+            try:
+                bindings = execute_sparql(endpoint, query)
+            except HTTPException as exc:
+                errori.append(f"{regione_norm}/{dataset_name}: {exc.detail}")
+                break
+
+            rows = parse_isbns(bindings)
+            if not rows:
+                break
+
+            isbns.extend(rows)
+
+            if len(rows) < SPARQL_PAGE_SIZE:
+                break
+
+            offset += SPARQL_PAGE_SIZE
+
+        isbns = sorted(set(isbns))
+        if isbns:
+            result = {
+                "codicescuola": codice,
+                "regione": regione_norm,
+                "dataset": dataset_name,
+                "endpoint": endpoint,
+                "isbns": isbns,
+            }
+            cache_sitemap_libri.set(cache_key, result)
+            return result
+
+    result = {
+        "codicescuola": codice,
+        "regione": normalize_regione_input(regione) if regione else None,
+        "dataset": None,
+        "endpoint": None,
+        "isbns": [],
+        "errori": errori[:20],
+    }
+    cache_sitemap_libri.set(cache_key, result)
+    return result
+
+
+def build_school_books_sitemap_xml(codice_scuola: str, isbns: List[str], base_url: str) -> str:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+
+    for isbn in sorted(set(isbns)):
+        loc = f"{base_url.rstrip('/')}/libro/{quote(isbn, safe='')}"
+        lines.append("  <url>")
+        lines.append(f"    <loc>{html.escape(loc, quote=True)}</loc>")
+        lines.append("  </url>")
+
+    lines.append("</urlset>")
+    return "\n".join(lines) + "\n"
+
+
 def fetch_sitemap_libri_isbns() -> List[str]:
     cache_key = "sitemap_libri_isbns"
     cached = cache_sitemap_libri.get(cache_key)
@@ -1396,7 +1508,10 @@ def _write_region_school_index_file(regione: str, codici_scuola: List[str], base
             filename_scuola = SITEMAP_SCHOOL_FILENAME_TEMPLATE.format(
                 codice_scuola=normalize_codice_scuola_for_filename(codice_scuola)
             )
-            loc = f"{school_dir_url}/{filename_scuola}"
+            # Passiamo la regione come query string: l'endpoint finale resta
+            # /sitemap-libri-scuola/{codice_scuola}.xml, ma così evita di provare
+            # tutti i dataset regionali e interroga subito quello corretto.
+            loc = f"{school_dir_url}/{filename_scuola}?regione={quote(regione, safe='')}"
             f.write("  <sitemap>\n")
             f.write(f"    <loc>{html.escape(loc, quote=True)}</loc>\n")
             f.write("  </sitemap>\n")
@@ -1432,7 +1547,7 @@ def _write_school_books_sitemap_file(codice_scuola: str, isbns: List[str], base_
 
 def generate_sitemap_libri_files() -> Dict[str, Any]:
     """
-    Genera su disco una sitemap a 3 livelli:
+    Genera su disco solo i primi 2 livelli della sitemap:
 
     1) /sitemap-libri.xml
        index leggero con una sitemap per regione.
@@ -1441,31 +1556,34 @@ def generate_sitemap_libri_files() -> Dict[str, Any]:
        index con una sitemap per ogni scuola della regione.
 
     3) /sitemap-libri-scuola/{codice_scuola}.xml
-       urlset con gli URL pubblici /libro/{isbn} della scuola.
+       NON viene generata su disco: viene prodotta dinamicamente al momento
+       interrogando il dataset libri MIUR della regione/scuola.
 
     Da eseguire fuori dalle richieste HTTP, ad esempio con cron:
         python main.py generate-sitemap-libri
     """
     SITEMAP_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Rimuove solo i file sitemap libri generati da questa utility.
     for old_file in SITEMAP_DIR.glob("sitemap-libri*.xml"):
         old_file.unlink()
 
-    for dirname in (SITEMAP_REGION_DIRNAME, SITEMAP_SCHOOL_DIRNAME):
-        directory = SITEMAP_DIR / dirname
-        if directory.exists():
-            for old_file in directory.glob("*.xml"):
-                old_file.unlink()
-        directory.mkdir(parents=True, exist_ok=True)
+    region_dir = SITEMAP_DIR / SITEMAP_REGION_DIRNAME
+    if region_dir.exists():
+        for old_file in region_dir.glob("*.xml"):
+            old_file.unlink()
+    region_dir.mkdir(parents=True, exist_ok=True)
+
+    # La directory scuola non serve più per i file dinamici; la puliamo se esiste
+    # per evitare confusione con vecchie sitemap statiche.
+    school_dir = SITEMAP_DIR / SITEMAP_SCHOOL_DIRNAME
+    if school_dir.exists():
+        for old_file in school_dir.glob("*.xml"):
+            old_file.unlink()
 
     base_url = PUBLIC_APP_BASE_URL.rstrip("/")
 
     regioni_con_scuole: List[str] = []
     scuole_totali = 0
-    sitemap_scuole_totali = 0
-    isbn_url_totali = 0
-    scuole_senza_libri = 0
     errori: List[str] = []
 
     for regione in REGIONI_CANONICHE:
@@ -1475,46 +1593,28 @@ def generate_sitemap_libri_files() -> Dict[str, Any]:
             errori.append(f"{regione}: {exc.detail}")
             continue
 
-        codici_con_libri: List[str] = []
+        if not codici_scuola:
+            continue
 
-        for codice_scuola in codici_scuola:
-            try:
-                libri_payload = fetch_libri(regione, codice_scuola)
-                isbns = parse_isbns([{"CodiceISBN": {"value": libro.get("CodiceISBN")}} for libro in libri_payload.get("libri", [])])
-                isbns = sorted(set(isbns))
-            except HTTPException as exc:
-                errori.append(f"{regione}/{codice_scuola}: {exc.detail}")
-                continue
-
-            if not isbns:
-                scuole_senza_libri += 1
-                continue
-
-            _write_school_books_sitemap_file(codice_scuola, isbns, base_url)
-            codici_con_libri.append(codice_scuola)
-            sitemap_scuole_totali += 1
-            isbn_url_totali += len(isbns)
-
-        if codici_con_libri:
-            _write_region_school_index_file(regione, codici_con_libri, base_url)
-            regioni_con_scuole.append(regione)
-            scuole_totali += len(codici_con_libri)
+        # Non controlliamo qui se la scuola ha libri: sarebbe troppo costoso.
+        # La verifica avviene dinamicamente sull'endpoint finale della scuola.
+        _write_region_school_index_file(regione, codici_scuola, base_url)
+        regioni_con_scuole.append(regione)
+        scuole_totali += len(codici_scuola)
 
     _write_sitemap_root_region_index_file(regioni_con_scuole, base_url)
 
     result = {
         "ok": not bool(errori),
         "regioni_totali": len(regioni_con_scuole),
-        "scuole_con_libri": scuole_totali,
-        "scuole_senza_libri": scuole_senza_libri,
-        "sitemap_scuole_totali": sitemap_scuole_totali,
-        "url_libro_totali": isbn_url_totali,
+        "sitemap_scuola_link_totali": scuole_totali,
         "directory": str(SITEMAP_DIR),
         "index": str(SITEMAP_DIR / SITEMAP_INDEX_FILENAME),
+        "nota": "Le sitemap scuola sono dinamiche e interrogano MIUR alla richiesta.",
         "errori": errori[:200],
         "errori_totali": len(errori),
     }
-    logger.info("Sitemap libri per regioni/scuole generata: %s", json.dumps(result, ensure_ascii=False))
+    logger.info("Sitemap libri regione/scuola generata: %s", json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -1989,24 +2089,40 @@ def sitemap_libri_regione_xml(regione_slug: str) -> FileResponse:
 
 
 @app.get("/sitemap-libri-scuola/{codice_scuola}.xml")
-def sitemap_libri_scuola_xml(codice_scuola: str) -> FileResponse:
-    """Serve la sitemap dei libri di una singola scuola."""
+def sitemap_libri_scuola_xml(
+    codice_scuola: str,
+    regione: Optional[str] = Query(
+        None,
+        description="Regione opzionale: se presente interroga solo il dataset MIUR della regione.",
+        max_length=100,
+    ),
+) -> Response:
+    """
+    Produce dinamicamente la sitemap dei libri di una singola scuola.
+
+    Non legge file XML da disco: fa una chiamata al dataset MIUR ALT della regione.
+    Se la regione non viene passata, prova i dataset regionali finché trova ISBN.
+    """
     try:
-        filename = SITEMAP_SCHOOL_FILENAME_TEMPLATE.format(
-            codice_scuola=normalize_codice_scuola_for_filename(codice_scuola)
-        )
+        codice = normalize_codice_scuola_for_filename(codice_scuola)
+        regione_norm = normalize_regione_input(regione) if regione else None
     except ValueError:
-        raise HTTPException(status_code=404, detail="Sitemap scuola non trovata")
+        raise HTTPException(status_code=404, detail="Codice scuola non valido")
 
-    sitemap_path = SITEMAP_DIR / SITEMAP_SCHOOL_DIRNAME / filename
+    payload = fetch_sitemap_school_isbns_dynamic(codice, regione=regione_norm)
+    isbns = payload.get("isbns", [])
 
-    if not sitemap_path.exists():
-        raise HTTPException(status_code=404, detail="Sitemap scuola non trovata")
-
-    return FileResponse(
-        path=sitemap_path,
+    # Sitemap vuota valida: Google la può leggere senza mandare in errore l'intero index.
+    xml = build_school_books_sitemap_xml(codice, isbns, PUBLIC_APP_BASE_URL)
+    return Response(
+        content=xml,
         media_type="application/xml; charset=utf-8",
-        filename=filename,
+        headers={
+            # Cache lato browser/CDN/proxy: evita di martellare MIUR se Google richiama spesso.
+            "Cache-Control": "public, max-age=86400",
+            "X-Sitemap-Book-Count": str(len(isbns)),
+            "X-Sitemap-School-Code": codice,
+        },
     )
 
 
